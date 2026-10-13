@@ -73,7 +73,7 @@ A typical workflow is to run with `-X` first, look at the images, and then run t
 | `--gpu` | Encode with NVENC (`h264_nvenc`) instead of `libx264`. Falls back to CPU if the GPU encode fails |
 | `-J`, `--jobs N` | Process N files in parallel (default 1) |
 | `-O`, `--overwrite` | Replace the source file instead of writing `<name>_trimmed.mp4` |
-| `-S`, `--subtitle FILE` | Burn in subtitles. Cannot be combined with trimming or extraction. Output is `<name>_subtitled.mp4` |
+| `-S`, `--subtitle FILE` | Burn in subtitles (see [Subtitles](#subtitles)). Cannot be combined with trimming or extraction |
 
 The default mode re-encodes (video `libx264` CRF 18, audio AAC 192k) so cuts land on exactly the frame you asked for. Only the first video stream and the first audio stream are kept.
 
@@ -90,6 +90,24 @@ With `-O`, the result is written to a temporary file and only replaces the sourc
 | `-H`, `-h`, `-?`, `--help` | Show help |
 
 `--dryrun` and `--log` can be combined, which is a good way to record a plan before running it. The log file contains timestamps and the full ffmpeg command for every step.
+
+## Subtitles
+
+```
+python Trim_mp4.py -F movie.mp4 -S captions.srt
+```
+
+`-S`, `--subtitle FILE` burns the subtitles permanently into the picture (hardcoded) using ffmpeg's `subtitles` filter. The result is written as `<name>_subtitled.mp4`; the original is untouched. The filter is provided by libass, so your ffmpeg build must include it. `.srt` is the usual format, and other formats the filter reads, such as `.ass`, should also work.
+
+How it behaves:
+
+- **Exclusive mode.** Subtitles cannot be combined with `-B`, `-E`, `-D`, `-L` or `-X`. The script stops with an error (exit code 2) before touching any file. To trim and add subtitles, do it in two runs: trim first, then run `-S` on the `_trimmed` file. Subtitle timestamps are relative to the start of the video being processed, so the subtitle file must match the trimmed video, not the original.
+- **Re-encoding.** The video is re-encoded (`libx264` CRF 18), because burned-in text changes the picture. The audio stream is copied unchanged. `-Q` has no effect here and `-T` is not used.
+- **GPU.** `--gpu` encodes with NVENC (`h264_nvenc`) instead of `libx264`, and falls back to the CPU if the GPU encode fails.
+- **One subtitle file per run.** In a batch (`-C`, `-R` or a wildcard `-F`) the same subtitle file is applied to every video, so subtitles are normally used with a single file selected via `-F`.
+- **Output.** `-O` replaces the source file, written via a temporary file so a failed encode never damages the original. Without it, an existing `_subtitled.mp4` is never overwritten; the next run writes `_subtitled_1.mp4`.
+- **Checks before work starts.** A missing or unreadable subtitle file stops the run with exit code 1. A subtitle path containing an apostrophe (`'`) is rejected; rename the file.
+- **Other switches.** `-J`, `--dryrun` and `--log` work as usual. `--dryrun` prints the ffmpeg command without writing anything.
 
 ## Segment files
 
@@ -157,5 +175,6 @@ python Trim_mp4.py -F movie.mp4 -S captions.srt --gpu
 
 - Only mp4 files are processed.
 - Quick mode (`-Q`) cuts at keyframes, so the result can differ from what `-X` shows. Use the default mode when exactness matters.
+- Subtitles are burned in only; they cannot be added as a selectable track, and cannot be combined with trimming in one run.
 - Subtitle paths containing an apostrophe are not supported.
 - Frame rate is read from the first video stream. Variable frame rate video is supported, but frame numbers are approximate for it.
