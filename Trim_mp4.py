@@ -1,456 +1,766 @@
-import ffmpeg
-import os
-import glob
+#!/usr/bin/env python3
+"""Trim_mp4 version 6.0
+
+Trim / cut mp4 files (frame accurate by default), extract the frames at the
+cut points for verification, or burn subtitles.  Requires ffmpeg and ffprobe
+on PATH.  Run with -h for usage.
+"""
+
 import argparse
+import datetime
+import glob
+import json
+import logging
+import os
+import re
 import shutil
+import subprocess
+import sys
+import tempfile
+import threading
 import time
+from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor
 
-""" Trim_mp4 version 5.0 (enhanced batch + safety features) """
+VERSION = "6.0"
+AUTO_LOG = "<auto>"
+EPS = 1e-6
+
+log = logging.getLogger("trim_mp4")
+
+VideoInfo = namedtuple("VideoInfo", "duration fps has_audio")
+
+# Output files made by this script; skipped when scanning with -C / -R
+GENERATED = re.compile(r"_(trimmed|subtitled)(_\d+)?$", re.IGNORECASE)
+
+HELP = f"""
+Trim_mp4 v{VERSION}
+
+Select files (switches are case-insensitive: -b = -B):
+  -C, --current          all mp4 files in the current directory
+  -R, --recursive        all mp4 files in the current directory and below
+  -F, --file PATTERN     specific file or wildcard pattern (e.g. "clips/*.mp4")
+
+What to keep / remove (time points on the ORIGINAL video):
+  -B, --begin N          kept video starts at N
+  -E, --end N            kept video ends at N (the frame at N is not included)
+  -D, --delete A B       remove the part from A up to B (repeatable)
+  -L, --list FILE        remove segments listed in FILE ("A B" per line, # = comment)
+  -T, --time s|f         values are seconds (default, decimals ok: 10.5) or
+                         frame numbers (f)
+
+Verify the cut points:
+  -X, --extract          do NOT trim; instead save the frames at the cut points as
+                         jpg next to the source: <name>_extract_<time>.jpg
+                         (<name>_extract_f<frame>.jpg with -T f). For every cut the
+                         last frame kept before it and the first frame kept after it
+                         are saved (with -B only the first kept frame, with -E only
+                         the last kept frame).
+
+Other:
+  -S, --subtitle FILE    burn subtitles (cannot be combined with trimming)
+  -Q, --quick            stream copy: very fast, no quality loss, but cuts snap to
+                         keyframes so they may be off by seconds (default is
+                         frame-accurate re-encoding)
+      --gpu              use NVENC (h264_nvenc) instead of libx264 for encoding
+  -J, --jobs N           files processed in parallel (default 1)
+  -O, --overwrite        replace the source file instead of writing <name>_trimmed.mp4
+      --dryrun           show what would be done, write nothing
+      --log [FILE]       also write a log file (default trim_mp4_<date>_<time>.log)
+  -H, -h, -?, --help     this help
+
+Segment file example:
+  10 20
+  30.5 40
+
+Examples:
+  Trim_mp4.py -F movie.mp4 -B 10.5 -E 95
+  Trim_mp4.py -C -D 10 20 -D 30 40 -J 4
+  Trim_mp4.py -F movie.mp4 -T f -B 240 -E 5000 -X      (check the cut frames first)
+  Trim_mp4.py -R -L cuts.txt --dryrun --log
+  Trim_mp4.py -F movie.mp4 -S captions.srt --gpu
+"""
+
+
+class VideoError(Exception):
+    pass
+
+
+# -------------------------------------------------
+# Logging
+# -------------------------------------------------
+
+class ConsoleFormatter(logging.Formatter):
+    def format(self, record):
+        msg = record.getMessage()
+        if record.levelno >= logging.WARNING:
+            return f"{record.levelname}: {msg}"
+        return msg
+
+
+def setup_logging(log_arg):
+    """Configure console (and optional file) logging; returns log file path or None."""
+    log.setLevel(logging.DEBUG)
+    log.propagate = False
+
+    console = logging.StreamHandler(sys.stdout)
+    console.setLevel(logging.INFO)
+    console.setFormatter(ConsoleFormatter())
+    log.addHandler(console)
+
+    if log_arg is None:
+        return None
+
+    path = log_arg
+    if path == AUTO_LOG:
+        path = datetime.datetime.now().strftime("trim_mp4_%Y%m%d_%H%M%S.log")
+
+    try:
+        handler = logging.FileHandler(path, encoding="utf-8")
+    except OSError as e:
+        log.warning(f"Cannot create log file {path}: {e}. Continuing without log file.")
+        return None
+
+    handler.setLevel(logging.DEBUG)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(message)s"))
+    log.addHandler(handler)
+    return path
+
 
 # -------------------------------------------------
 # Utility
 # -------------------------------------------------
 
-def probe_video(input_file):
-    probe = ffmpeg.probe(input_file)
+def parse_rate(text):
+    try:
+        num, den = str(text).split("/")
+        num, den = float(num), float(den)
+        return num / den if den else 0.0
+    except (ValueError, TypeError):
+        return 0.0
 
-    duration = float(probe['format']['duration'])
 
-    fps = 30
-    for s in probe['streams']:
-        if s['codec_type'] == 'video':
-            num, den = s['r_frame_rate'].split('/')
-            fps = float(num) / float(den)
+def probe_video(path):
+    cmd = ["ffprobe", "-v", "error",
+           "-show_entries",
+           "format=duration:stream=codec_type,r_frame_rate,avg_frame_rate,duration",
+           "-of", "json", path]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace")
+    except OSError as e:
+        raise VideoError(f"cannot run ffprobe: {e}")
+
+    if r.returncode != 0:
+        lines = r.stderr.strip().splitlines()
+        raise VideoError(lines[-1] if lines else "ffprobe failed")
+
+    try:
+        info = json.loads(r.stdout or "{}")
+    except ValueError:
+        raise VideoError("unreadable ffprobe output")
+
+    streams = info.get("streams", [])
+    video = [s for s in streams if s.get("codec_type") == "video"]
+    if not video:
+        raise VideoError("no video stream")
+    has_audio = any(s.get("codec_type") == "audio" for s in streams)
+
+    duration = None
+    for candidate in (info.get("format", {}).get("duration"), video[0].get("duration")):
+        try:
+            duration = float(candidate)
             break
+        except (TypeError, ValueError):
+            pass
+    if not duration or duration <= 0:
+        raise VideoError("cannot determine duration")
 
-    return duration, fps
+    fps = parse_rate(video[0].get("avg_frame_rate")) or parse_rate(video[0].get("r_frame_rate"))
+    if fps <= 0:
+        log.warning(f"{path}: cannot determine frame rate, assuming 30 fps")
+        fps = 30.0
 
-
-def convert_time(value, mode, fps):
-    if value is None:
-        return None
-
-    if mode == 'f':
-        return float(value) / fps
-
-    return float(value)
+    return VideoInfo(duration, fps, has_audio)
 
 
 def safe_remove(path):
     try:
-        if os.path.exists(path):
+        if path and os.path.exists(path):
             os.remove(path)
-    except:
+    except OSError:
         pass
 
 
-def writable(path):
+def dir_writable(directory, dry):
+    """True if files can be created in directory (dry run: permission check only)."""
+    if dry:
+        return os.access(directory, os.W_OK)
     try:
-        with open(path, 'wb'):
+        with tempfile.TemporaryFile(dir=directory):
             pass
-        os.remove(path)
         return True
-    except:
+    except OSError:
         return False
+
+
+def unique_name(path, suffix):
+    base, ext = os.path.splitext(path)
+    out = f"{base}{suffix}{ext}"
+    i = 1
+    while os.path.exists(out):
+        out = f"{base}{suffix}_{i}{ext}"
+        i += 1
+    return out
+
+
+def temp_name(out):
+    base, ext = os.path.splitext(out)
+    return f"{base}.~{os.getpid()}_{threading.get_ident()}{ext}"
+
+
+def fmt_time(t, fps):
+    return f"{t:.3f}s (f{int(round(t * fps))})"
+
+
+def time_label(t, fps, mode):
+    if mode == "f":
+        return f"f{int(round(t * fps))}"
+    return f"{t:.3f}".rstrip("0").rstrip(".") or "0"
+
+
+def run_cmd(cmd, dry):
+    """Run a command; returns (ok, error text)."""
+    line = subprocess.list2cmdline(cmd)
+    if dry:
+        log.info(f"  [DRYRUN] {line}")
+        return True, ""
+
+    log.debug(f"RUN {line}")
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace")
+    except OSError as e:
+        return False, str(e)
+
+    if r.returncode != 0:
+        lines = [l for l in r.stderr.strip().splitlines() if l.strip()]
+        return False, " | ".join(lines[-3:]) or f"exit code {r.returncode}"
+    return True, ""
+
+
+def ffmpeg_base():
+    return ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y"]
+
+
+def encode_args(gpu):
+    if gpu:
+        video = ["-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "19", "-b:v", "0"]
+    else:
+        video = ["-c:v", "libx264", "-preset", "medium", "-crf", "18"]
+    return video + ["-c:a", "aac", "-b:a", "192k", "-map_metadata", "0",
+                    "-movflags", "+faststart"]
+
+
+# -------------------------------------------------
+# Planning
+# -------------------------------------------------
+
+def load_segments_from_file(path):
+    """Raw (start, end) values exactly as written in the file."""
+    segments = []
+    with open(path, encoding="utf-8-sig") as f:
+        for n, line in enumerate(f, 1):
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) != 2:
+                raise ValueError(f"line {n}: expected 'start end', got '{line}'")
+            try:
+                segments.append((float(parts[0]), float(parts[1])))
+            except ValueError:
+                raise ValueError(f"line {n}: not a number in '{line}'")
+    return segments
+
+
+def plan_cuts(args, info, raw_segments):
+    """Return (removed, kept) interval lists in seconds on the source timeline."""
+    duration, fps = info.duration, info.fps
+
+    def conv(v):
+        return v / fps if args.time_mode == "f" else v
+
+    removed = []
+
+    begin = conv(args.begin) if args.begin is not None else None
+    end = conv(args.end) if args.end is not None else None
+
+    if begin is not None and begin >= duration:
+        raise VideoError(f"begin ({fmt_time(begin, fps)}) is beyond the end of the video")
+    if end is not None and end <= 0:
+        raise VideoError("end must be greater than 0")
+    if end is not None and end > duration:
+        log.warning(f"end ({fmt_time(end, fps)}) is beyond the video; using the full length")
+        end = None
+    if begin is not None and begin > EPS:
+        removed.append((0.0, begin))
+    if end is not None and end < duration - EPS:
+        removed.append((end, duration))
+
+    for a, b in list(args.delete or []) + list(raw_segments):
+        a, b = conv(a), conv(b)
+        if a >= b or b <= 0 or a >= duration:
+            log.warning(f"ignoring invalid or out-of-range segment {a:.3f}-{b:.3f}s")
+            continue
+        removed.append((max(0.0, a), min(duration, b)))
+
+    removed.sort()
+    merged = []
+    for a, b in removed:
+        if merged and a <= merged[-1][1] + EPS:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], b))
+        else:
+            merged.append((a, b))
+
+    min_len = 0.5 / fps
+    kept, cursor = [], 0.0
+    for a, b in merged:
+        if a - cursor >= min_len:
+            kept.append((cursor, a))
+        cursor = b
+    if duration - cursor >= min_len:
+        kept.append((cursor, duration))
+
+    return merged, kept
+
 
 # -------------------------------------------------
 # Video operations
 # -------------------------------------------------
 
-def trim_edges(input_file, output_file, begin, end):
-    try:
-        duration, _ = probe_video(input_file)
+def extract_frames(path, info, kept, args):
+    fps, duration = info.fps, info.duration
 
-        if begin is None:
-            begin = 0
+    points = []
+    for a, b in kept:
+        if a > EPS:
+            points.append(a)                      # first frame kept after a cut
+        if b < duration - EPS:
+            points.append(max(a, b - 1.0 / fps))  # last frame kept before a cut
 
-        if end is not None:
-            clip_duration = max(0, duration - begin - end)
+    names = {}
+    base = os.path.splitext(path)[0]
+    for t in points:
+        names.setdefault(f"{base}_extract_{time_label(t, fps, args.time_mode)}.jpg", t)
+
+    outdir = os.path.dirname(os.path.abspath(path))
+    if not dir_writable(outdir, args.dryrun):
+        log.error(f"{path}: no write permission in {outdir}")
+        return False
+
+    ok_all = True
+    for out, t in names.items():
+        if os.path.exists(out) and not os.access(out, os.W_OK):
+            log.error(f"{out}: exists and is write protected")
+            ok_all = False
+            continue
+
+        # seek a quarter frame early so the frame at t is the first one decoded
+        seek = max(0.0, t - 0.25 / fps)
+        cmd = ffmpeg_base() + ["-ss", f"{seek:.6f}", "-i", path, "-map", "0:v:0",
+                               "-frames:v", "1", "-q:v", "2", "-update", "1", out]
+        ok, err = run_cmd(cmd, args.dryrun)
+        if ok:
+            verb = "would extract" if args.dryrun else "Extracted"
+            log.info(f"  {verb} frame at {fmt_time(t, fps)} -> {out}")
         else:
-            clip_duration = duration - begin
+            log.error(f"{path}: frame extraction failed at {fmt_time(t, fps)}: {err}")
+            safe_remove(out)
+            ok_all = False
 
-        (
-            ffmpeg
-            .input(input_file, ss=begin)
-            .output(output_file, t=clip_duration, c='copy')
-            .run(overwrite_output=True, quiet=True)
-        )
-
-        return True
-
-    except Exception as e:
-        print("Trim error:", e)
-        return False
+    return ok_all
 
 
+def cut_accurate(path, tmp, info, kept, args):
+    fps, duration = info.fps, info.duration
 
-def delete_segments(input_file, output_file, segments):
+    def snap(t):
+        # boundaries sit a quarter frame early so float rounding can never drop a frame
+        return max(0.0, t - 0.25 / fps)
 
-    try:
-
-        temp_files = []
-        concat_file = "._concat.txt"
-
-        with open(concat_file, "w") as f:
-
-            last_end = 0
-            idx = 0
-
-            for start, end in segments:
-
-                if start <= last_end:
-                    last_end = max(last_end, end)
-                    continue
-
-                part = f"._part{idx}.mp4"
-
-                (
-                    ffmpeg
-                    .input(input_file, ss=last_end, t=start-last_end)
-                    .output(part, c='copy')
-                    .run(overwrite_output=True, quiet=True)
-                )
-
-                f.write(f"file '{part}'\n")
-                temp_files.append(part)
-
-                idx += 1
-                last_end = end
-
-            part = f"._part{idx}.mp4"
-
-            (
-                ffmpeg
-                .input(input_file, ss=last_end)
-                .output(part, c='copy')
-                .run(overwrite_output=True, quiet=True)
-            )
-
-            f.write(f"file '{part}'\n")
-            temp_files.append(part)
-
-        (
-            ffmpeg
-            .input(concat_file, format='concat', safe=0)
-            .output(output_file, c='copy')
-            .run(overwrite_output=True, quiet=True)
-        )
-
-        for t in temp_files:
-            safe_remove(t)
-
-        safe_remove(concat_file)
-
-        return True
-
-    except Exception as e:
-        print("Segment delete error:", e)
-        return False
-
-
-
-def embed_subtitles_gpu(input_file, output_file, srt_file, use_gpu=True):
-
-    if not os.path.exists(srt_file):
-        print("Subtitle file missing")
-        return False
-
-    try:
-
-        if use_gpu:
-            (
-                ffmpeg
-                .input(input_file)
-                .output(output_file,
-                        vf=f"subtitles={srt_file}",
-                        vcodec="h264_nvenc",
-                        acodec="copy")
-                .run(overwrite_output=True, quiet=True)
-            )
-
+    def build(gpu):
+        cmd = ffmpeg_base()
+        if len(kept) == 1:
+            a, b = kept[0]
+            if a > EPS:
+                cmd += ["-ss", f"{snap(a):.6f}"]
+            cmd += ["-i", path]
+            if b < duration - EPS:
+                cmd += ["-t", f"{snap(b) - snap(a):.6f}"]
+            cmd += ["-map", "0:v:0", "-map", "0:a:0?"]
         else:
-            (
-                ffmpeg
-                .input(input_file)
-                .output(output_file,
-                        vf=f"subtitles={srt_file}")
-                .run(overwrite_output=True, quiet=True)
-            )
+            chains, concat_in = [], ""
+            for i, (a, b) in enumerate(kept):
+                opts = []
+                if a > EPS:
+                    opts.append(f"start={snap(a):.6f}")
+                if b < duration - EPS:
+                    opts.append(f"end={snap(b):.6f}")
+                trim = ":".join(opts)
+                chains.append(f"[0:v:0]{'trim=' + trim + ',' if trim else ''}"
+                              f"setpts=PTS-STARTPTS[v{i}]")
+                concat_in += f"[v{i}]"
+                if info.has_audio:
+                    chains.append(f"[0:a:0]{'atrim=' + trim + ',' if trim else ''}"
+                                  f"asetpts=PTS-STARTPTS[a{i}]")
+                    concat_in += f"[a{i}]"
+            n_audio = 1 if info.has_audio else 0
+            out_labels = "[v][a]" if info.has_audio else "[v]"
+            chains.append(f"{concat_in}concat=n={len(kept)}:v=1:a={n_audio}{out_labels}")
+            cmd += ["-i", path, "-filter_complex", ";".join(chains), "-map", "[v]"]
+            if info.has_audio:
+                cmd += ["-map", "[a]"]
+        return cmd + encode_args(gpu) + [tmp]
 
-        return True
+    ok, err = run_cmd(build(args.gpu), args.dryrun)
+    if not ok and args.gpu:
+        log.warning(f"{path}: GPU encoding failed ({err}); retrying on CPU")
+        ok, err = run_cmd(build(False), args.dryrun)
+    if not ok:
+        log.error(f"{path}: cut failed: {err}")
+    return ok
 
-    except ffmpeg.Error:
-        print("Subtitle embedding failed (codec/GPU issue)")
+
+def cut_quick(path, tmp, info, kept, args):
+    duration = info.duration
+
+    def part_cmd(a, b, target):
+        cmd = ffmpeg_base()
+        if a > EPS:
+            cmd += ["-ss", f"{a:.6f}"]
+        cmd += ["-i", path]
+        if b < duration - EPS:
+            cmd += ["-t", f"{b - a:.6f}"]
+        return cmd + ["-map", "0:v:0", "-map", "0:a:0?", "-c", "copy",
+                      "-avoid_negative_ts", "make_zero", target]
+
+    if len(kept) == 1:
+        ok, err = run_cmd(part_cmd(*kept[0], tmp), args.dryrun)
+        if not ok:
+            log.error(f"{path}: cut failed: {err}")
+        return ok
+
+    outdir = os.path.dirname(os.path.abspath(tmp))
+    workdir = os.path.join(outdir, ".trim_work") if args.dryrun \
+        else tempfile.mkdtemp(prefix=".trim_", dir=outdir)
+    try:
+        lines = []
+        for i, (a, b) in enumerate(kept):
+            part = os.path.join(workdir, f"part{i}.mp4")
+            ok, err = run_cmd(part_cmd(a, b, part), args.dryrun)
+            if not ok:
+                log.error(f"{path}: cut failed: {err}")
+                return False
+            lines.append("file '" + part.replace("\\", "/").replace("'", "'\\''") + "'\n")
+
+        listfile = os.path.join(workdir, "concat.txt")
+        if not args.dryrun:
+            with open(listfile, "w", encoding="utf-8") as f:
+                f.writelines(lines)
+
+        cmd = ffmpeg_base() + ["-f", "concat", "-safe", "0", "-i", listfile,
+                               "-c", "copy", "-movflags", "+faststart", tmp]
+        ok, err = run_cmd(cmd, args.dryrun)
+        if not ok:
+            log.error(f"{path}: joining parts failed: {err}")
+        return ok
+    finally:
+        if not args.dryrun:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+
+def do_cut(path, info, kept, args):
+    out = path if args.overwrite else unique_name(path, "_trimmed")
+    outdir = os.path.dirname(os.path.abspath(out))
+
+    if args.overwrite and not os.access(path, os.W_OK):
+        log.error(f"{path}: write protected, cannot overwrite")
+        return False
+    if not dir_writable(outdir, args.dryrun):
+        log.error(f"{path}: no write permission in {outdir}")
         return False
 
+    tmp = temp_name(out)
+    try:
+        cut = cut_quick if args.quick else cut_accurate
+        if not cut(path, tmp, info, kept, args):
+            return False
 
-# -------------------------------------------------
-# Segment sources
-# -------------------------------------------------
+        if args.dryrun:
+            log.info(f"  [DRYRUN] would write {out}")
+            return True
 
-def load_segments_from_file(path):
+        try:
+            os.replace(tmp, out)
+        except OSError as e:
+            log.error(f"{path}: cannot write {out}: {e} (in use or write protected?)")
+            return False
 
-    segments = []
+        log.info(f"Wrote {out}")
+        return True
+    finally:
+        if not args.dryrun:
+            safe_remove(tmp)
 
-    if not os.path.exists(path):
-        print("Segment file not found")
-        return segments
+
+def do_subtitles(path, args):
+    out = path if args.overwrite else unique_name(path, "_subtitled")
+    outdir = os.path.dirname(os.path.abspath(out))
+
+    if args.overwrite and not os.access(path, os.W_OK):
+        log.error(f"{path}: write protected, cannot overwrite")
+        return False
+    if not dir_writable(outdir, args.dryrun):
+        log.error(f"{path}: no write permission in {outdir}")
+        return False
+
+    srt = os.path.abspath(args.subtitle).replace("\\", "/").replace(":", "\\:")
+    tmp = temp_name(out)
+
+    def build(gpu):
+        video = ["-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "19", "-b:v", "0"] \
+            if gpu else ["-c:v", "libx264", "-preset", "medium", "-crf", "18"]
+        return ffmpeg_base() + ["-i", path, "-vf", f"subtitles='{srt}'"] + video + \
+            ["-c:a", "copy", "-movflags", "+faststart", tmp]
 
     try:
-        with open(path) as f:
-            for line in f:
-                line=line.strip()
-                if not line or line.startswith("#"):
-                    continue
+        ok, err = run_cmd(build(args.gpu), args.dryrun)
+        if not ok and args.gpu:
+            log.warning(f"{path}: GPU encoding failed ({err}); retrying on CPU")
+            ok, err = run_cmd(build(False), args.dryrun)
+        if not ok:
+            log.error(f"{path}: subtitle embedding failed: {err}")
+            return False
 
-                parts=line.split()
+        if args.dryrun:
+            log.info(f"  [DRYRUN] would write {out}")
+            return True
 
-                if len(parts)!=2:
-                    continue
+        try:
+            os.replace(tmp, out)
+        except OSError as e:
+            log.error(f"{path}: cannot write {out}: {e} (in use or write protected?)")
+            return False
 
-                segments.append((float(parts[0]),float(parts[1])))
-
-    except Exception as e:
-        print("Segment file error:",e)
-
-    return segments
+        log.info(f"Wrote {out}")
+        return True
+    finally:
+        if not args.dryrun:
+            safe_remove(tmp)
 
 
 # -------------------------------------------------
 # File processing
 # -------------------------------------------------
 
-def get_output_filename(input_file):
-
-    base, ext = os.path.splitext(input_file)
-
-    out = f"{base}_trimmed{ext}"
-
-    i = 1
-
-    while os.path.exists(out):
-        out = f"{base}_trimmed_{i}{ext}"
-        i += 1
-
-    return out
-
-
-def process_file(file, args):
-
-    if not os.path.exists(file):
-        print("Missing file", file)
+def process_file(path, args, raw_segments):
+    try:
+        return _process_file(path, args, raw_segments)
+    except Exception as e:  # keep one bad file from stopping the batch
+        log.error(f"{path}: unexpected error: {e!r}")
         return False
 
-    if not file.lower().endswith(".mp4"):
-        print("Skipping non-mp4", file)
+
+def _process_file(path, args, raw_segments):
+    if not os.path.isfile(path):
+        log.error(f"Missing file {path}")
+        return False
+    if not path.lower().endswith(".mp4"):
+        log.warning(f"Skipping non-mp4 {path}")
+        return False
+    if not os.access(path, os.R_OK):
+        log.error(f"{path}: no read permission")
         return False
 
     try:
-        duration, fps = probe_video(file)
-    except:
-        print("Incompatible video", file)
+        info = probe_video(path)
+    except VideoError as e:
+        log.error(f"{path}: incompatible video ({e})")
         return False
 
-    out = file if args.overwrite else get_output_filename(file)
-
-    if not args.overwrite and not writable(out):
-        print("Cannot write", out)
-        return False
-
-    # -------------------------------------------------
-    # Safety rule: subtitles cannot be combined with trimming
-    # -------------------------------------------------
-
-    if args.subtitle and (args.begin or args.end or args.delete or args.segfile):
-        print("WARNING: Subtitles can not be added simultanously with video trimming")
-        return False
-
-    # -------------------------------------------------
-    # Load segments
-    # -------------------------------------------------
-
-    segments = []
-
-    if args.delete:
-        for f,t in args.delete:
-
-            start = convert_time(f,args.time_mode,fps)
-            end   = convert_time(t,args.time_mode,fps)
-
-            if start>=end:
-                print("Invalid delete range",f,t)
-                continue
-
-            segments.append((start,end))
-
-    if args.segfile:
-        segments.extend(load_segments_from_file(args.segfile))
-
-    if segments:
-
-        segments.sort()
-
-        if not delete_segments(file,out,segments):
-            return False
-
-        file = out
-
-    # -------------------------------------------------
-    # Edge trimming
-    # -------------------------------------------------
-
-    if args.begin or args.end:
-
-        temp = out+"._tmp.mp4"
-
-        if not trim_edges(
-            file,
-            temp,
-            convert_time(args.begin,args.time_mode,fps),
-            convert_time(args.end,args.time_mode,fps)
-        ):
-            return False
-
-        shutil.move(temp,out)
-        file = out
-
-    # -------------------------------------------------
-    # Subtitles
-    # -------------------------------------------------
+    log.info(f"{path}: {info.duration:.3f}s, {info.fps:.3f} fps"
+             f"{'' if info.has_audio else ', no audio'}")
 
     if args.subtitle:
+        return do_subtitles(path, args)
 
-        temp = out+"._sub.mp4"
+    try:
+        removed, kept = plan_cuts(args, info, raw_segments)
+    except VideoError as e:
+        log.error(f"{path}: {e}")
+        return False
 
-        if not embed_subtitles_gpu(file,temp,args.subtitle,args.gpu):
-            return False
+    if not removed:
+        log.info("  Nothing to cut")
+        return True
+    if not kept:
+        log.error(f"{path}: the cuts would remove the entire video")
+        return False
 
-        shutil.move(temp,out)
+    for a, b in removed:
+        log.info(f"  remove {fmt_time(a, info.fps)} - {fmt_time(b, info.fps)}")
 
-    print("Processed",file)
+    if args.extract:
+        return extract_frames(path, info, kept, args)
 
-    return True
+    return do_cut(path, info, kept, args)
 
 
 # -------------------------------------------------
 # Batch processing
 # -------------------------------------------------
 
-def process_files(args):
-
-    files = []
-
+def collect_files(args):
+    explicit = False
     if args.filename:
-        files = glob.glob(args.filename)
-
+        files = glob.glob(args.filename, recursive=True)
+        explicit = True
     elif args.recursive:
-        files = glob.glob("**/*.mp4",recursive=True)
-
-    elif args.current:
+        files = glob.glob("**/*.mp4", recursive=True)
+    else:
         files = glob.glob("*.mp4")
 
+    files = sorted({os.path.normpath(f) for f in files if os.path.isfile(f)})
+
+    if not explicit:
+        files = [f for f in files if not GENERATED.search(os.path.splitext(f)[0])]
+    return files
+
+
+def process_files(args, raw_segments):
+    files = collect_files(args)
     if not files:
-        print("No files found")
-        return
+        log.error("No files found")
+        return False
 
-    start=time.time()
+    start = time.time()
+    exe = ThreadPoolExecutor(max(1, args.jobs))
+    try:
+        results = list(exe.map(lambda f: process_file(f, args, raw_segments), files))
+    except KeyboardInterrupt:
+        exe.shutdown(wait=False, cancel_futures=True)
+        log.warning("Interrupted")
+        return False
+    exe.shutdown()
 
-    ok=0
-
-    workers=max(1,args.jobs)
-
-    with ThreadPoolExecutor(workers) as exe:
-        results=list(exe.map(lambda f:process_file(f,args),files))
-
-    ok=sum(results)
-
-    print()
-    print("Processed",ok,"of",len(files))
-    print("Time",round(time.time()-start,2),"sec")
+    ok = sum(results)
+    log.info("")
+    log.info(f"Processed {ok} of {len(files)}")
+    log.info(f"Time {time.time() - start:.2f} sec")
+    return ok == len(files)
 
 
 # -------------------------------------------------
 # CLI
 # -------------------------------------------------
 
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        print(f"Error: {message}\nUse -h for help.", file=sys.stderr)
+        sys.exit(2)
+
+
+def build_parser():
+    p = Parser(add_help=False, allow_abbrev=False)
+
+    def opt(letter, long, **kw):
+        names = [f"-{letter.upper()}", f"-{letter.lower()}"] if letter else []
+        if long:
+            names.append(f"--{long}")
+        p.add_argument(*names, **kw)
+
+    opt("C", "current", action="store_true", dest="current")
+    opt("R", "recursive", action="store_true", dest="recursive")
+    opt("F", "file", dest="filename", metavar="PATTERN")
+    opt("B", "begin", type=float, dest="begin", metavar="N")
+    opt("E", "end", type=float, dest="end", metavar="N")
+    opt("D", "delete", nargs=2, action="append", type=float, dest="delete", metavar=("A", "B"))
+    opt("L", "list", dest="segfile", metavar="FILE")
+    opt("T", "time", dest="time_mode", default="s", type=str.lower, choices=["s", "f"])
+    opt("X", "extract", action="store_true", dest="extract")
+    opt("S", "subtitle", dest="subtitle", metavar="FILE")
+    opt("Q", "quick", action="store_true", dest="quick")
+    opt("J", "jobs", type=int, default=1, dest="jobs", metavar="N")
+    opt("O", "overwrite", action="store_true", dest="overwrite")
+    opt(None, "gpu", action="store_true", dest="gpu")
+    opt(None, "dryrun", action="store_true", dest="dryrun")
+    opt(None, "log", nargs="?", const=AUTO_LOG, default=None, dest="log", metavar="FILE")
+    p.add_argument("-H", "-h", "-?", "--help", action="store_true", dest="help")
+    return p
+
+
 def main():
+    try:
+        sys.stdout.reconfigure(errors="replace")
+        sys.stderr.reconfigure(errors="replace")
+    except AttributeError:
+        pass
 
-    parser = argparse.ArgumentParser(add_help=False)
+    parser = build_parser()
+    args = parser.parse_args()
 
-    parser.add_argument("-R","-r",action="store_true",dest="recursive")
+    if args.help or len(sys.argv) == 1:
+        print(HELP)
+        return 0
 
-    parser.add_argument("-C","-c",action="store_true",dest="current")
+    if not (args.filename or args.recursive or args.current):
+        parser.error("select files with -F, -C or -R")
+    if args.jobs < 1:
+        parser.error("-J must be at least 1")
 
-    parser.add_argument("-F","-f",dest="filename")
+    cutting = any(v is not None for v in (args.begin, args.end, args.delete, args.segfile))
+    if args.subtitle and (cutting or args.extract):
+        parser.error("subtitles cannot be combined with trimming or extraction")
+    if not (cutting or args.subtitle):
+        parser.error("nothing to do: use -B, -E, -D, -L or -S")
+    if args.begin is not None and args.begin < 0:
+        parser.error("-B must not be negative")
+    if args.begin is not None and args.end is not None and args.begin >= args.end:
+        parser.error("-B must be smaller than -E")
+    for a, b in args.delete or []:
+        if a < 0 or a >= b:
+            parser.error(f"invalid -D range {a:g} {b:g}")
 
-    parser.add_argument("-B",type=float,dest="begin")
+    for tool in ("ffmpeg", "ffprobe"):
+        if not shutil.which(tool):
+            parser.error(f"{tool} not found on PATH")
 
-    parser.add_argument("-E",type=float,dest="end")
+    log_path = setup_logging(args.log)
+    log.debug(f"Trim_mp4 {VERSION} args: {' '.join(sys.argv[1:])}")
+    if log_path:
+        log.info(f"Logging to {log_path}")
+    if args.dryrun:
+        log.info("DRY RUN - nothing will be written")
 
-    parser.add_argument("-D",nargs=2,action="append",type=float,dest="delete")
+    if args.subtitle:
+        if not os.path.isfile(args.subtitle) or not os.access(args.subtitle, os.R_OK):
+            log.error(f"Subtitle file missing or unreadable: {args.subtitle}")
+            return 1
+        if "'" in args.subtitle:
+            log.error("Subtitle path must not contain an apostrophe")
+            return 1
 
-    parser.add_argument("-L",dest="segfile")
+    raw_segments = []
+    if args.segfile:
+        try:
+            raw_segments = load_segments_from_file(args.segfile)
+        except (OSError, ValueError) as e:
+            log.error(f"Segment file {args.segfile}: {e}")
+            return 1
 
-    parser.add_argument("-T",dest="time_mode",default="s")
-
-    parser.add_argument("-S",dest="subtitle")
-
-    parser.add_argument("--gpu",action="store_true",dest="gpu")
-
-    parser.add_argument("-J",type=int,default=1,dest="jobs")
-
-    parser.add_argument("-O",action="store_true",dest="overwrite")
-
-    parser.add_argument("-h","-H","-?",action="store_true",dest="help")
-
-    args=parser.parse_args()
-
-    args.time_mode=str(args.time_mode).lower()
-
-    if args.help:
-        print("""
-Trim_mp4 v5
-
--C             current directory
--R             recursive
--F file        specific file
-
--B n           trim beginning
--E n           trim end
-
--D f t         delete segment (repeatable)
--L file        delete segments from file
-
--T s|f         seconds or frames
-
--S file        burn subtitles (exclusive mode)
---gpu          GPU encoding for subtitles
-
--J n           parallel jobs
-
--O             overwrite source
-
-Example segment file:
-
-10 20
-30 40
-
-Example usage:
-
-parallel processing
--J 4 -C
-
-remove segments from file
--L cuts.txt
-
-subtitles only
--S captions.srt --gpu
-""")
-        return
-
-    process_files(args)
+    return 0 if process_files(args, raw_segments) else 1
 
 
-if __name__=="__main__":
-    main()
+if __name__ == "__main__":
+    sys.exit(main())
